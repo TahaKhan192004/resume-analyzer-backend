@@ -59,15 +59,14 @@ def applicant_role_values(applicant: Applicant) -> list[str]:
 
 
 def applicant_matches_job(applicant: Applicant, job: JobProfile) -> tuple[bool, str]:
-    if applicant.job_id == job.id:
-        return True, ""
-
     job_tokens = role_tokens(job.title)
     if not job_tokens:
         return False, "The selected job has no comparable title."
 
     roles = applicant_role_values(applicant)
     if not roles:
+        if applicant.job_id == job.id:
+            return True, ""
         return False, "The applicant has no applied role stored."
 
     for role in roles:

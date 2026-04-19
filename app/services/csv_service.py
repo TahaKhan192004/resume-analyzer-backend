@@ -218,9 +218,25 @@ def _canonicalize_row(
     return normalized, mapping
 
 
-def _find_existing_applicant(session: Session, *, application_id: str | None, candidate_email: str | None, applied_role: str | None) -> Applicant | None:
+def _find_existing_applicant(
+    session: Session,
+    *,
+    job_id: UUID,
+    application_id: str | None,
+    candidate_email: str | None,
+    applied_role: str | None,
+) -> Applicant | None:
     if application_id:
         applicant = session.exec(select(Applicant).where(Applicant.application_id == application_id)).first()
+        if applicant:
+            return applicant
+    if candidate_email:
+        applicant = session.exec(
+            select(Applicant).where(
+                Applicant.candidate_email == candidate_email,
+                Applicant.job_id == job_id,
+            )
+        ).first()
         if applicant:
             return applicant
     if candidate_email and applied_role:
@@ -270,6 +286,7 @@ def import_applicant_csv(session: Session, *, data: bytes, file_name: str, job_i
         applied_role = original.get("applied_role") or original.get("final_position_applied") or original.get("position_applied_from_email")
         applicant = _find_existing_applicant(
             session,
+            job_id=job_id,
             application_id=application_id,
             candidate_email=candidate_email,
             applied_role=applied_role,

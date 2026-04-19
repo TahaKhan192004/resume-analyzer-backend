@@ -8,6 +8,7 @@ from app.db.session import get_session
 from app.models.entities import Applicant, ApplicantImport, EvaluationStatus, JobProfile, User
 from app.services.csv_service import import_applicant_csv
 from app.services.deletion_service import delete_import_tree
+from app.services.role_matching import applicant_matches_job
 from app.workers.tasks import evaluate_applicant_task
 
 router = APIRouter(prefix="/imports", tags=["imports"])
@@ -15,6 +16,13 @@ router = APIRouter(prefix="/imports", tags=["imports"])
 
 def _status_value(status: object) -> str:
     return getattr(status, "value", str(status))
+
+
+def _applicant_progress_status(applicant: Applicant) -> str:
+    outputs = applicant.system_outputs or {}
+    if outputs.get("resume_analysis_status") == "role_mismatch":
+        return "role_mismatch"
+    return _status_value(applicant.processing_status)
 
 
 @router.get("")
@@ -26,7 +34,7 @@ def list_imports(session: Session = Depends(get_session), _: User = Depends(get_
         job = session.get(JobProfile, import_record.job_id)
         counts: dict[str, int] = {}
         for applicant in applicants:
-            status = _status_value(applicant.processing_status)
+            status = _applicant_progress_status(applicant)
             counts[status] = counts.get(status, 0) + 1
         results.append({**import_record.model_dump(), "job_title": job.title if job else "", "counts": counts, "applicant_count": len(applicants)})
     return results
@@ -39,16 +47,37 @@ async def upload_import(
     session: Session = Depends(get_session),
     _: User = Depends(get_current_user),
 ):
+    job = session.get(JobProfile, job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
     data = await file.read()
     record, applicant_ids = import_applicant_csv(session, data=data, file_name=file.filename or "applicants.csv", job_id=job_id)
+    queued_ids = []
+    skipped = []
     for applicant_id in applicant_ids:
         applicant = session.get(Applicant, applicant_id)
-        if applicant:
-            applicant.system_outputs = {**(applicant.system_outputs or {}), "queued_job_id": str(job_id)}
+        if not applicant:
+            skipped.append({"applicant_id": str(applicant_id), "reason": "Applicant not found after import."})
+            continue
+        matches_role, reason = applicant_matches_job(applicant, job)
+        if not matches_role:
+            applicant.processing_status = EvaluationStatus.pending
+            applicant.system_outputs = {
+                **(applicant.system_outputs or {}),
+                "resume_analysis_status": "role_mismatch",
+                "role_match_reason": reason,
+                "queued_job_id": None,
+            }
             session.add(applicant)
+            skipped.append({"applicant_id": str(applicant.id), "candidate_name": applicant.candidate_name, "reason": reason})
+            continue
+        applicant.processing_status = EvaluationStatus.queued
+        applicant.system_outputs = {**(applicant.system_outputs or {}), "resume_analysis_status": "queued", "queued_job_id": str(job_id)}
+        session.add(applicant)
+        queued_ids.append(applicant.id)
     session.commit()
-    task_ids = [evaluate_applicant_task.delay(str(applicant_id), str(job_id)).id for applicant_id in applicant_ids]
-    return {**record.model_dump(), "queued_applicant_ids": applicant_ids, "task_ids": task_ids}
+    task_ids = [evaluate_applicant_task.delay(str(applicant_id), str(job_id)).id for applicant_id in queued_ids]
+    return {**record.model_dump(), "queued_applicant_ids": queued_ids, "task_ids": task_ids, "skipped": skipped}
 
 
 @router.get("/{import_id}/progress")
@@ -62,13 +91,14 @@ def import_progress(
     job = session.get(JobProfile, import_record.job_id) if import_record else None
     counts: dict[str, int] = {}
     for applicant in applicants:
-        status = _status_value(applicant.processing_status)
+        status = _applicant_progress_status(applicant)
         counts[status] = counts.get(status, 0) + 1
     completed = counts.get("completed", 0)
     failed = counts.get("failed", 0)
     missing_resume = counts.get("missing_resume", 0)
+    role_mismatch = counts.get("role_mismatch", 0)
     total = len(applicants)
-    done = completed + failed + missing_resume
+    done = completed + failed + missing_resume + role_mismatch
     return {
         "import_id": import_id,
         "status": import_record.status if import_record else "",
@@ -81,9 +111,10 @@ def import_progress(
             {
                 "id": applicant.id,
                 "candidate_name": applicant.candidate_name,
-                "processing_status": applicant.processing_status,
+                "processing_status": _applicant_progress_status(applicant),
                 "decision": (applicant.system_outputs or {}).get("final_candidate_decision"),
                 "score": (applicant.system_outputs or {}).get("final_candidate_score"),
+                "reason": (applicant.system_outputs or {}).get("role_match_reason"),
             }
             for applicant in applicants
         ],
